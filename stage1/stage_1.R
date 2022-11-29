@@ -2,29 +2,65 @@ rm(list=ls())
 require(here)
 source(here('settings.R'))
 source(here("utils.R"))
-########################################### stage 1 ####################################################
-# local_environment
-# input : 1) 기관_data.csv, common_columns.rds
-# output : 1) changed data, 2) Z1Z2List, 3)total_model
-#          4)each_model, 5)lambda parameter of total model,  6)lambda parameter of each model
+# ########################################### stage 1 ####################################################
+# # local_environment
+# # input : 1) 기관_data.csv
+# # output : 1) changed data train and validation, 2) label, 3) Z1Z2List
+# #          4) loss_model(loss계산을 위한 모델), 5) lasso logistic, xgb model,
 
-# settings.R에서 초기값 설정이 필요합니다.
+set.seed(2022)
+here()
+getwd()
+insti <- 'gangnam'
+drug <- 'Acetaminophen'
+
+method <- 'ExtraTrees'
+name <- glue('{drug}_{insti}_{method}_train')
+name_val <- glue('{drug}_{insti}_{method}_val')
+
+file_name <- glue("{name}.csv")
+file_name_val <- glue("{name_val}.csv")
+
+
+# # settings.R에서 초기값 설정이 필요합니다.
 stage1_path <- here('stage1')
-
-input_path <- here(stage1_path,'input')
+input_path <- here(stage1_path,glue('all_drugs_propensity_matching/{insti}/'))
 output_path <- here(stage1_path,'output')
+common_columns <- readRDS('common_columns.rds')
 
-# 파일 읽어오기
-df <- read.csv(here(input_path,file_name)) 
 
+# # 파일 읽어오기
+df <- read.csv(here(input_path,file_name))
+df_val <- read.csv(here(input_path,file_name_val))
 using_columns <- setdiff(colnames(df), except_features)
 df <- df %>% select(using_columns)
-# features + intercept (현재는 label이 대신 count되어 결과적으로는 같음)
-n_F <- ncol(df)
+df_val <- df_val %>% select(using_columns)
 
+str_col <- paste0(drug ,'_str')
+int_col <- paste0(drug ,'_int')
+str_cols <- setdiff(common_columns[str_col][[1]], c('cohort_start_date','person_id'))
+int_cols <- lapply(common_columns[int_col],function(x){paste0('X',x)})[[1]]
+df <- df[,c(str_cols, int_cols)]
+df_val <- df_val[,c(str_cols, int_cols)]
+
+# features + intercept (현재는 label이 대신 count되어 결과적으로는 같음)
 print('df loaded')
 df_changed <- namer_function(df)
-saveRDS(df_changed, here(output_path, glue('lasso_{name}_changed.rds')))
+df_changed_val <- namer_function(df_val)
+n_F <- ncol(df_changed)
+
+saveRDS(df_changed, here(output_path, glue('{name}_changed.rds')))
+saveRDS(df_changed_val, here(output_path, glue('{name_val}_changed.rds')))
+
+# make local model and save
+local_fit <- logistic_lasso_train(df_changed,'Y')
+xgb_fit<-xgboost_train(df_changed,'Y')
+models <- list(local_fit,xgb_fit)
+
+saveRDS(models, file=here("stage2/input",glue("models_{name}_fit.rds")))
+saveRDS(models, file=here(output_path, glue("models_{name}_fit.rds")))
+saveRDS(df_changed[,'Y'], file=here(output_path, glue("{drug}_{insti}_train_label.rds")))
+saveRDS(df_changed_val[,'Y'], file=here(output_path, glue("{drug}_{insti}_val_label.rds")))
 
 # Z1과 Z2를 만든다.
 Generate.Z1.Z2 <- function(local.data, predictor, m)
@@ -62,17 +98,7 @@ saveRDS(Z1Z2List, file = here("stage2/input", glue("lasso_Z1Z2_{name}.rds")))
 
 
 
-# make local model and save
-local_fit_cv <- cv.glmnet(x = as.matrix(df_changed[,-c(1)]),
-                           y = as.matrix(df_changed[,'Y']), family = 'binomial',alpha=1)
-local_fit <- glmnet(x = as.matrix(df_changed[,-c(1)]),
-                    y = as.matrix(df_changed[,'Y']),
-                    alpha=1, family="binomial",lambda=local_fit_cv$lambda.min )
-
-saveRDS(local_fit, file=here(output_path, glue("lasso_{name}_fit.rds")))
-
-
-# 모델을 만든다.
+# loss 계산을 위한 모델을 만든다.
 make_model <- function(z1z2list, party_name){
   m <- z1z2list[[1]] %>% length
   
@@ -82,8 +108,8 @@ make_model <- function(z1z2list, party_name){
   for(i in 1:m){
     fitting_data <- as.data.frame(z1z2list[[1]][[i]])
     lasso_cv <- cv.glmnet(x = as.matrix(fitting_data[,-c(1)]),
-                           y = fitting_data[,'Y'], family = 'binomial',alpha=1)
-    assign(paste0('glm','.',party_name,'.',i), 
+                          y = fitting_data[,'Y'], family = 'binomial',alpha=1)
+    assign(paste0('glm','.',party_name,'.',i),
            glmnet(x = fitting_data[,-c(1)],
                   y = fitting_data[,'Y'],
                   alpha=1, family="binomial",lambda=lasso_cv$lambda.min),
@@ -92,15 +118,6 @@ make_model <- function(z1z2list, party_name){
     }
 
 make_model(Z1Z2List, name) # 모델이 메모리 상에 생성됨
-
-# 각 lasso마다의 lambda를 저장
-lambda.set <- c()
-for (i in 1:n_I){
-  lambda.selected <- get(paste0('glm.',name,'.',i))$lambda
-  lambda.set <- c(lambda.set, lambda.selected)
-}
-lambda.set %>% saveRDS(file=here(output_path,glue('lasso_lambda_{name}.rds')))
-
 
 # coefficient matrix를 만든다.
 make_coefficient_matrix <- function(z1z2list, party_name)
@@ -136,5 +153,9 @@ make_coefficient_matrix <- function(z1z2list, party_name)
 make_coefficient_matrix(Z1Z2List, name)
 total_model <- get(glue('total_model_{name}'))
 # intercept와 계수
-total_model %>% saveRDS(file=here(output_path,glue('lasso_total_model_{name}.rds')))
-total_model %>% saveRDS(file = here("stage2/input", glue("lasso_total_model_{name}.rds")))
+total_model %>% saveRDS(file=here(output_path,glue('lasso_loss_model_{name}.rds')))
+total_model %>% saveRDS(file=here("stage2/input", glue("lasso_loss_model_{name}.rds")))
+print('ee')
+print('=============================================================================================================')
+print(glue('{insti} {drug} stage 1 is finished successfully. 단계 1가 성공적으로 종료되었습니다'))
+print("=============================================================================================================")
